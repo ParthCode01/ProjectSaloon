@@ -1,0 +1,39 @@
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Java/Maven
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# Node/Vite
+node_modules/
+dist/
+.vite/
+*.log
+
+# Environment/Secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Build artifacts
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Package manager locks (keep these for reproducibility)
+# package-lock.json - KEEP
+# pom.xml - KEEP
