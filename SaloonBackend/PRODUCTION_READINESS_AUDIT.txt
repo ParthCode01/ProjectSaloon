@@ -1,0 +1,470 @@
+===============================================================================
+PRODUCTION READINESS AUDIT — SaloonManagement (Spring Boot Multi-Tenant SaaS)
+================================================================================
+Auditor  : Senior Java Backend Engineer / Production Readiness Review
+Date     : 2026-09-15
+Method   : Full codebase review + live verification (ran `mvnw.cmd test`
+           against local MySQL/Redis). Compile OK, but 2 of 3 tests FAIL,
+           confirming two hard bugs.
+
+--------------------------------------------------------------------------------
+0. VERIFICATION (what was actually run)
+--------------------------------------------------------------------------------
+- Read all 42 main sources + configs + both test files
+- `git log` / `git ls-files` scans for committed secrets
+- Ran `mvnw.cmd test` against live local MySQL/Redis
+  -> compile OK; 2 of 3 tests FAIL (details in section 8)
+
+--------------------------------------------------------------------------------
+1. ARCHITECTURE SUMMARY
+--------------------------------------------------------------------------------
+Layered monolith, single shared MySQL database with row-level multi-tenancy.
+
+     Controller -> Service -> Repository (Spring Data JPA) -> MySQL
+                     ^
+              SecurityContext (JWT via stateless filter chain)
+
+Tenant isolation = service-layer pattern, NOT filters/interceptors/schemas.
+
+- Packages : config, controller, dto, entity, exception, repository,
+             security, service
+- Roles    : ROLE_OWNER, ROLE_CUSTOMER, ROLE_STYLIST
+- Entities :
+    User -> Tenant (M:1)
+    Stylist -> Tenant (M:1), -> User (1:1), <-> Booking (1:N)
+    Treatment -> Tenant (M:1)
+    Booking -> User / Treatment / Stylist / Tenant (all M:1)
+- Auth flow: email/password -> BCrypt verify -> JWT (HS256, 24h, subject=email,
+  NO tenant/role claims) -> JwtAuthenticationFilter loads User from DB per request
+- Multi-tenancy: every repository query takes Tenant (or User) as scoping arg;
+  user resolved from SecurityContext each request
+- External deps: MySQL, Redis (declared but UNUSED — @EnableCaching, no @Cacheable)
+- Config: application.properties (env placeholders for DB creds + JWT secret = GOOD),
+  .env untracked = GOOD, ddl-auto=update
+- Deployment: nothing Docker-related exists; no profiles; no actuator; no logging
+
+Request flow example (booking):
+  POST /api/bookings -> BookingController -> BookingService.createBooking
+  -> resolve user from SecurityContext -> tenant-scoped findByIdAndTenant for
+     treatment + stylist -> conflict queries -> save -> BookingResponse.
+
+--------------------------------------------------------------------------------
+2. FEATURE COMPLETENESS AUDIT
+--------------------------------------------------------------------------------
+Legend: BLOCKER = app does not start / core feature dead. HIGH = must fix.
+        MEDIUM = should fix soon. LOW = can wait.
+
+| Feature | Status | Correct | Missing | Priority |
+|---------|--------|---------|---------|----------|
+| Authentication (login/signup/customer-signup) | Works, gaps | BCrypt, env-secret JWT, duplicate-email check, customer signup w/ tenantId | Login of unknown email -> 404 (should be 401). User.email has no DB unique constraint (race -> duplicate users). signUp/customerSignUp not @Transactional (orphan tenant if save fails) | HIGH |
+| Multi-tenancy | Mostly enforced | Nearly all queries tenant-scoped (findByIdAndTenant, findByTenant) | 3 service methods bypass role checks (section 3). Tenants list is world-readable (by design, verify) | HIGH |
+| Treatments CRUD | Works | Tenant-scoped CRUD, positive validation duration/price | NO role restriction in SecurityConfig — any authenticated user (incl. CUSTOMERs) can create/update/delete treatments | HIGH |
+| Stylists CRUD | Works | Tenant-scoped CRUD, OWNER-only URL rule | CUSTOMERs cannot read stylist list (blocks booking UX). StylistRequest has no workStartTime/workEndTime | HIGH |
+| Bookings (create) | BROKEN | @Future start, tenant-scoped treatment/stylist, endTime=start+duration, overlap detection | BookingService.java:75 NPE: stylist.getWorkStartTime() is null because no API sets work hours -> every booking attempt 500s | BLOCKER |
+| Booking lifecycle (confirm/complete/cancel) | Broken | State guards (only-pending->confirm, only-confirmed->complete), owner v customer cancel | @PreAuthorize dead (section 3). completeBooking no error when non-owner calls. PUT status has no transition validation | CRITICAL |
+| Booking lists (all/my/tenant) | Works-ish | User-scoped and tenant-scoped queries | Ambiguous route (GET /api/bookings mapped twice) -> app fails to start. N+1 on list endpoints | BLOCKER |
+| Stylist self-bookings | Works | @PreAuthorize STYLIST URL rule + service role check | None reachable today (owner-gated /api/stylists/** also applies to /me/bookings; STYLIST rule listed first so OK) | LOW |
+| Tenants directory | Works | Returns id/name/address | Requires auth, but customer-signup is public -> onboarding chicken-and-egg (no way to discover tenantId pre-login) | MEDIUM |
+| Error handling | Broken | Custom exceptions + @RestControllerAdvice | Handler binds java.nio.file.AccessDeniedException, NOT your custom one -> your AccessDeniedException -> 500. No 400/validation/catch-all handlers | HIGH |
+| Tests | Fail | Booking conflict unit test passes | contextLoads fails (ambiguous mapping). createBooking_shouldCreateBookingSuccessfully fails (work-hours NPE) | BLOCKER |
+
+--------------------------------------------------------------------------------
+3. SECURITY AUDIT
+--------------------------------------------------------------------------------
+
+3a. AUTHENTICATION
+  Registration        : Works. Owner signup creates Tenant+Owner; dup email -> 409. Customer signup public + tenantId OK.
+  Password hashing    : BCrypt, encoder bean correct.
+  JWT generation      : subject + iat + exp, HS256, 24h. No role/tenant claims -> DB hit per request (acceptable for MVP).
+  Invalid/expired JWT : 500, not 401. extractUsername() throws ExpiredJwtException / MalformedJwtException /
+                        SignatureException uncaught inside the filter. Expired/malformed tokens must produce 401.
+  Deleted user w/ valid token : UserDetailService.loadUserByUsername throws raw RuntimeException -> 500.
+  Stateless           : CSRF off, no sessions — appropriate for JWT.
+
+3b. AUTHORIZATION (two big problems)
+  1) SecurityConfig has NO @EnableMethodSecurity. Every @PreAuthorize in
+     BookingController is SILENTLY IGNORED. Effect once ambiguous mapping is fixed:
+       - PATCH /api/bookings/{id}/confirm      -> any CUSTOMER of tenant can confirm any pending booking
+                                                (confirmBooking has no service-level role check)
+       - PATCH /api/bookings/{id}/completed    -> any role can call (status stays for non-owners, but 200 no-op)
+       - PATCH /api/bookings/{id}/cancel       -> redundant with PUT status
+       - GET /api/bookings (owner tenant view) -> redundant method anyway (section 2)
+  2) Role authorization for Treatments missing entirely. SecurityConfig rules:
+       /api/bookings/**   OWNER|CUSTOMER
+       /api/stylists/**   OWNER
+       everything else    authenticated()
+     => POST/DELETE/PUT /api/treatments/** reachable by CUSTOMERs — they can
+        create/delete/update the salon treatment catalog.
+
+  Endpoint role audit:
+    POST /api/stylists        intended OWNER, actual OWNER (URL rule) .................. OK
+    GET  /api/stylists        intended OWNER(?), actual OWNER only — customers can't browse stylists
+    ALL  /api/treatments/**   intended OWNER mutations, actual any authenticated ........ BROKEN
+    PATCH confirm/completed   intended OWNER, actual any authenticated ................. BROKEN (once mapped)
+    PATCH cancel              intended OWNER/CUSTOMER, actual any authenticated ....... BROKEN (has service ownership check)
+    GET  /api/tenants         intended public (onboarding), actual any authenticated .. design decision
+    GET  /api/stylists/me/bookings   STYLIST — listed before /api/stylists/** so OK .... OK
+
+3c. MULTI-TENANCY / IDOR REVIEW
+  Strong / tenant-safe (verified query by query):
+    - createBooking: treatment + stylist fetched via findByIdAndTenant(user's tenant)
+        -> cannot book another tenant's resources; user/stylist same tenant by construction
+    - getBookingById, deleteBooking, updateBookingStatus:
+        OWNER -> findByIdAndTenant, CUSTOMER -> findByIdAndUser
+    - getAllBookings, getMyTenantBookings, getMyUserBookings: scoped by tenant/user
+    - StylistService / TreatmentService all use findByIdAndTenant / findByTenant
+    - Conflict queries use the (already tenant-scoped) stylist object -> no cross-tenant leakage
+    - cancelBooking: tenant-scoped fetch + explicit ownership check
+        -> same-tenant cross-customer cancel -> AccessDeniedException
+
+  Weak / at risk (NOT cross-tenant, but privilege escalation within a tenant):
+    - confirmBooking, completeBooking, getMyTenantBookings rely 100% on dead @PreAuthorize
+        -> once app runs, any customer in the tenant can confirm bookings.
+        Fix: add @EnableMethodSecurity (or method-level role checks).
+    - GET /api/tenants exposes every tenant id/name/address to any authenticated user
+        -> fine for public directory, but know that's what you're shipping.
+
+  VERDICT: TRUE cross-tenant IDOR (Tenant A reads/modifies Tenant B data) is NOT
+  present. Vulnerabilities are horizontal (within-tenant role escalation), all
+  tracing back to method security being off.
+
+3d. SECRETS
+    DB password               : in untracked .env only — NOT in git .......... GOOD
+    JWT secret                : env placeholder in application.properties .... GOOD
+                                old placeholder IS in git history (commit 2d776cc)
+                                — throwaway string, low risk; rotate anyway
+    .env                      : untracked ................................... GOOD
+    Hardcoded creds in docs   : PROJECT_DOCUMENTATION.md contains placeholder secret + stale notes (not sensitive)
+
+  MUST be env vars before deployment: DB_USERNAME, DB_PASSWORD, JWT_SECRET (done)
+  PLUS move spring.datasource.url and spring.data.redis.* off hardcoded localhost.
+
+--------------------------------------------------------------------------------
+4. DATABASE AUDIT
+--------------------------------------------------------------------------------
+| Item                | Verdict |
+|---------------------|---------|
+| Relationships       | Sound. All FK relationships present; @ElementCollection for skills OK |
+| Fetch strategy      | ManyToOne defaults EAGER for single loads — fine. List endpoints then hit N+1 on booking.getTreatment().getName() / getStylist().getName() |
+| Cascades            | None declared -> deleting Treatment/Stylist with bookings -> FK violation -> unhandled 500. Decide: block (409) or cascade |
+| Unique constraints  | BROKEN: User.email has no unique=true -> concurrent signups create duplicates (getByEmail then throws). Add unique index (email) |
+| Indexes             | findBookingByStylist.../findByUser... scan on (stylist_id)/(user_id) only. Add composite indexes: bookings(stylist_id,start_time,end_time), bookings(user_id,start_time,end_time), bookings(tenant_id), users(email) unique. Cheap, do it |
+| Nullable fields     | Stylist.workStartTime/WorkEndTime nullable -> null-safe check required (this is the booking NPE) |
+| Enum persistence    | @Enumerated(STRING) — safe |
+| ID generation       | IDENTITY auto-increment — safe |
+| Orphan records      | Signup creates Tenant then User without @Transactional -> failed User insert orphans a Tenant row |
+| ddl-auto=update     | Fine for MVP local. For prod use validate + Flyway/Liquibase LATER (not a must for MVP) |
+| Migrations          | DEFER. Only needed when prod has real data and schema changes |
+| OSIV                | default open-in-view=true — acceptable for MVP; set false in prod later |
+
+REQUIRED before deployment: unique email index + 3 booking indexes.
+IMPROVE later: Flyway, open-in-view=false, join-fetch / @EntityGraph.
+
+--------------------------------------------------------------------------------
+5. BUSINESS LOGIC AUDIT
+--------------------------------------------------------------------------------
+Booking create (BookingService.createBooking):
+  - @Future on startTime ...................... correct
+  - endTime = start + duration ................ correct (duration @Positive at DTO)
+  - Stylist overlap check ..................... CORRECT overlap predicate:
+        existing.start < new.end && existing.end > new.start
+        (catches containment; allows adjacent bookings)
+  - User double-booking check ................. correct
+  - WORK-HOURS CHECK NPEs when workStartTime/WorkEndTime are null — and there is
+    NO endpoint to set them. Booking creation is 100% broken in the real flow.
+  - RACE CONDITION: check-then-insert, no lock -> two simultaneous requests both
+    pass conflict check -> double booking (full analysis in section 9)
+  - No upper bound on booking horizon (beyond @Future) — fine for MVP
+
+Status transitions:
+  - updateBookingStatus: no transition legality validation for owners
+    (can flip COMPLETED->PENDING via PUT status)
+  - confirm/complete/cancel have guards, BUT:
+      completeBooking: non-owner -> silent 200 no-op instead of 403/404
+      confirmBooking: no role check at service level (relies on dead @PreAuthorize)
+      cancelBooking: correct ownership logic (returns 500 today via exception-handler bug)
+
+Signup race: email existence check then save -> duplicates possible (no DB unique).
+
+--------------------------------------------------------------------------------
+6. API AUDIT
+--------------------------------------------------------------------------------
+| Method | Endpoint                  | Auth   | Role       | Validation      | Tenant-safe | Error handling          | Status |
+|--------|---------------------------|--------|------------|-----------------|-------------|-------------------------|--------|
+| POST   | /api/auth/signup          | public | -          | @Valid          | n/a (creates tenant) | 409 dup, 500 on orphan | OK |
+| POST   | /api/auth/login           | public | -          | @Valid          | n/a | 404 unknown email (should be 401) | FIX |
+| POST   | /api/auth/customer-signup | public | -          | @Valid          | resolves tenantId | OK | OK |
+| POST   | /api/bookings             | JWT    | any        | @Valid          | YES | 500 NPE (work hours) | BROKEN |
+| GET    | /api/bookings             | JWT    | any        | -               | YES | unreachable | BROKEN (ambiguous / duplicated) |
+| GET    | /api/bookings/{id}        | JWT    | own/tenant | -               | YES | 404 | OK |
+| PUT    | /api/bookings/{id}/status | JWT    | own/tenant | NOT @Valid, status nullable | YES | AccessDenied -> 500 | BROKEN |
+| DELETE | /api/bookings/{id}        | JWT    | own/tenant | -               | YES | 200 w/ body (should be 204) | FIX |
+| GET    | /api/bookings/my          | JWT    | any        | -               | YES | OK | OK |
+| PATCH  | confirm / completed       | JWT    | (OWNER intended) | -          | YES | role bypass | BROKEN |
+| PATCH  | cancel                    | JWT    | (any)      | -               | YES service-level | AccessDenied -> 500 | BROKEN |
+| GET    | /api/stylists             | JWT    | OWNER      | -               | YES | OK | customers blocked |
+| POST/PUT/DELETE | /api/stylists/** | JWT | OWNER (URL) | @Valid | YES | OK | OK |
+| GET    | /api/stylists/me/bookings | JWT    | STYLIST    | -               | YES | 404 if no stylist profile | OK |
+| GET    | /api/treatments           | JWT    | any        | -               | YES | OK | OK |
+| POST/DELETE/PUT | /api/treatments/** | JWT | any (BUG) | @Valid | YES | customers can mutate | BROKEN |
+| GET    | /api/tenants              | JWT    | any        | -               | n/a | OK | pre-login onboarding gap |
+
+Sensitive data in responses: NONE — no passwords/contacts/emails leak in mappings.
+
+--------------------------------------------------------------------------------
+7. EXCEPTION HANDLING
+--------------------------------------------------------------------------------
+| Item | Verdict |
+|------|---------|
+| ResourceNotFoundException   | 404 string body — OK |
+| BookingConflictException    | 409 string body — OK |
+| InvalidCredentialsException | 401 — OK |
+| UserAlreadyExistsException  | 409 — OK |
+| AccessDeniedException       | BROKEN: handler bound to java.nio.file.AccessDeniedException, not your custom class (GlobalExceptionHandler.java:8) -> your exception -> unhandled -> 500 |
+| Validation (MethodArgumentNotValidException) | NO handler -> default Boot 400, different JSON shape |
+| Malformed body / bad enum (HttpMessageNotReadableException) | NO handler -> 400 default |
+| JWT errors (Expired/Malformed/SignatureException) | uncaught in filter -> 500 |
+| DB errors / unexpected      | NO catch-all -> 500, stack trace leaks into logs |
+| Response format             | Inconsistent: app errors = plain string, Spring errors = {timestamp,status,error,path}. Pick ONE schema {message, status, ...} |
+
+--------------------------------------------------------------------------------
+8. TESTING AUDIT
+--------------------------------------------------------------------------------
+Current state (RUN locally): 3 tests, 2 FAIL.
+
+  contextLoads (SaloonManagementApplicationTests)          : FAIL — ambiguous mapping, app can't start
+  createBooking_shouldCreateBookingSuccessfully            : FAIL — NPE (work hours null; also proves the prod bug)
+  createBooking_shouldThrowExceptionWhenStylistAlreadyBooked: PASS
+
+High-value tests to ADD (recommended MVP minimum — not 100 tests):
+  1. AuthServiceTest: signup creates owner+tenant; dup email -> 409;
+     login wrong password -> 401; customer signup unknown tenant -> 404
+  2. BookingServiceTest (extend existing): user double-book conflict;
+     work-hours boundary (start==open / end==close pass, outside fail);
+     confirm-only-if-pending; complete-only-if-confirmed;
+     cancel-own vs cancel-other (customer denied, owner allowed)
+  3. TenantIsolationTest (integration): Tenant A's token cannot GET/PATCH/DELETE
+     Tenant B's booking/treatment/stylist -> expect 404 not 403/500
+     (THE test for your SaaS selling point)
+  4. SecurityIntegrationTest (MockMvc): customer PATCH confirm -> 403 once method
+     security enabled; unauthenticated -> 401; expired/garbage JWT -> 401 not 500
+  5. BookingConcurrencyTest: two threads same slot -> exactly one succeeds
+
+--------------------------------------------------------------------------------
+9. CONCURRENCY / RACE-CONDITION REVIEW
+--------------------------------------------------------------------------------
+YES, the double-booking race exists.
+
+    Request A: SELECT conflicts -> none
+    Request B: SELECT conflicts -> none
+    Request A: INSERT
+    Request B: INSERT   <- both succeed, same stylist + time
+
+Nothing serializes check-then-insert: no @Transactional (each query is its own
+transaction, so the window is wide), no pessimistic lock, no unique constraint.
+
+Real production concern? For an MVP single-instance deployment the probability is
+low but non-zero (two POS clicks / two customers same hot slot). It is a
+CORRECTNESS bug, not availability: worst case = overbooked stylist.
+
+Simplest appropriate fix:
+  - @Transactional on createBooking
+  - pessimistic lock on the stylist row inside:
+        SELECT ... FROM stylist WHERE id=? AND tenant_id=? FOR UPDATE
+    (add @Lock(LockModeType.PESSIMISTIC_WRITE) to a repo method)
+  Then run conflict checks + insert in that transaction. Serializes bookings per
+  stylist -> second request's conflict check sees first request's insert.
+  - Optional second-line guard: unique index on (stylist_id, start_time, status).
+
+Must fix before MVP? DEFERRABLE but cheap -> I'd fix it (10 lines) since conflict
+logic is otherwise the strongest part of the app.
+
+--------------------------------------------------------------------------------
+10. CONFIGURATION AUDIT
+--------------------------------------------------------------------------------
+Current application.properties:
+  - DB url hardcoded localhost:3306/saloonmanagement
+  - DB creds + JWT via env (GOOD)
+  - Redis hardcoded localhost
+  - ddl-auto=update
+  - no profiles, no actuator, no server.port override (8080 default), no logging config
+
+LOCAL (fine as-is): .env + placeholders, Redis on localhost, ddl-auto=update.
+
+PRODUCTION (change before deploy):
+  - spring.datasource.url  -> ${DB_URL:jdbc:mysql://db:3306/saloonmanagement} or host/port vars
+  - spring.data.redis.host / port -> env vars
+  - spring.jpa.open-in-view=false
+  - spring.jpa.hibernate.ddl-auto=validate (after migrations or after first prod run)
+  - Add application-prod.properties only if it helps; env vars cover most
+
+Must NOT be committed: real JWT_SECRET, real DB password, prod DB URL.
+
+--------------------------------------------------------------------------------
+11. LOGGING AUDIT
+--------------------------------------------------------------------------------
+Currently ZERO logging. Minimum viable setup:
+  - SLF4J (already available via Spring Boot/Logback) at SERVICE layer:
+      login succeeded: <email>
+      booking created: id=<>, stylist=<>, start=<>
+      booking conflict: stylist=<>, start=<>
+      warn/error for all handled exceptions with context (email, tenantId, resource id)
+  - NEVER log passwords, JWT bodies, or full tokens (you don't today; keep it that way)
+  - Catch-all handler logs the stack trace server-side while returning clean JSON
+
+--------------------------------------------------------------------------------
+12. PERFORMANCE AUDIT
+--------------------------------------------------------------------------------
+Real (non-premature) issues only:
+  - N+1 in getAllBookings / getMyTenantBookings / getMyUserBookings / getMyBookings
+    (n x 2 queries for treatment + stylist names). IGNORE FOR MVP.
+    Fix later with @EntityGraph(attributePaths={"treatment","stylist"}) join-fetch.
+  - No pagination on bookings lists. Later, not now.
+  - MISSING INDEXES (section 4) — the cheap real win before deployment.
+  - Hikari default pool fine.
+  - Redis declared but unused — either use it or drop it to reduce Docker moving
+    parts for MVP (I'd drop it from compose).
+
+--------------------------------------------------------------------------------
+13. DOCKER READINESS AUDIT
+--------------------------------------------------------------------------------
+Must fix before Docker: app MUST start (ambiguous mapping) and booking MUST work
+(NPE), else the Docker demo fails on first click.
+
+Required changes:
+  - Add spring-boot-starter-actuator (healthcheck endpoint for compose)
+  - Externalize DB_URL, DB_USERNAME, DB_PASSWORD, JWT_SECRET, REDIS_HOST via env
+  - Create Dockerfile — multi-stage:
+       maven:3.9-eclipse-temurin-17 AS build  (./mvnw clean package)   [fix tests first]
+       eclipse-temurin:17-jre
+       COPY --from=build app.jar, EXPOSE 8080, ENTRYPOINT java -jar
+  - docker-compose.yml:
+       app   (build ., ports 8080:8080, env_file: .env, depends_on mysql+redis,
+              restart: unless-stopped, healthcheck /actuator/health)
+       mysql (8, named volume for data, MYSQL_ROOT_PASSWORD etc.)
+       redis (alpine)   [optional — drop if unused]
+  - .dockerignore (target/, .git, .idea, .env)
+  - Java 17 OK, Spring Boot 4.1.1 OK, Maven wrapper OK
+  - mvnw.cmd clean package -> jar at target/SaloonManagement-0.0.1-SNAPSHOT.jar
+
+Checklist in section 17.
+
+--------------------------------------------------------------------------------
+14. DEPLOYMENT READINESS (MINIMUM VIABLE PRODUCTION)
+--------------------------------------------------------------------------------
+  - Host       : single VPS ($5-10/mo) is enough. No K8s / microservices / managed AWS needed.
+  - Run        : Docker Compose (app + mysql [+ redis]) behind Nginx or Caddy.
+                 Caddy = free HTTPS in a ~10-line config (recommended over manual certbot).
+  - Persistence: named volume for MySQL — NON-NEGOTIABLE.
+  - Env vars   : real JWT_SECRET (e.g. openssl rand -base64 48), real DB password, prod DB url.
+  - HTTPS/CORS : HTTPS via Caddy. CORS allowedOrigins for your frontend domain
+                 (NO CORS config exists today — required the day a browser calls it).
+  - Restart/monitor: compose restart: unless-stopped + actuator /actuator/health + uptime check.
+                     That is your minimum viable monitoring. Add Docker log rotation.
+  - Backups    : nightly mysqldump to host volume / object storage — NON-NEGOTIABLE with real data.
+  - Firewall   : only 443/80 exposed; 3306/6379 stay INSIDE the compose network (never public).
+
+--------------------------------------------------------------------------------
+15. GIT / GITHUB AUDIT
+--------------------------------------------------------------------------------
+| Item | Status |
+|------|--------|
+| .gitignore | solid: target/, .env, .idea, application-local.properties — GOOD |
+| Secrets committed | NO real secrets in git. DB password never committed. Old placeholder JWT in history (harmless; rotate anyway) — GOOD |
+| .env | untracked — GOOD |
+| .idea | untracked — GOOD |
+| PROJECT_DOCUMENTATION.md | contains placeholder secret string + stale/superseded notes (not sensitive). Refresh later, not a blocker |
+| README | MISSING — add a short one for the portfolio (setup, env vars, docker run). Optional for deployment |
+| Branches | single working branch, 6 clean well-scoped commits — GOOD |
+
+Action before deploy: nothing to rewrite in history. Optionally trim docs.
+
+--------------------------------------------------------------------------------
+16. PRODUCTION FAILURE SCENARIOS
+--------------------------------------------------------------------------------
+| Scenario | Current behavior | Risk | Fix before deploy? | Fix |
+|----------|------------------|------|--------------------|-----|
+| Invalid/expired JWT | 500 (uncaught in filter) | Med | YES | catch JwtException/ExpiredJwtException -> 401 JSON |
+| Malformed JWT | 500 | Med | YES | same as above |
+| Valid JWT, user deleted | 500 (RuntimeException) | Low | YES | UsernameNotFoundException -> 401 |
+| Wrong tenantId in booking refs | correct 404 (tenant-scoped lookups) | None | — | — |
+| ID tampering on other tenant's booking | 404 (findByIdAndTenant) | None | — | — |
+| Customer confirms/completes others' bookings | ALLOWED (no method security) | High | YES | add @EnableMethodSecurity |
+| Customer mutates treatments | ALLOWED (no role rule) | High | YES | URL rule or service-level checks |
+| Booking double-submit / concurrent | Both succeed | Med | cheap, can defer | pessimistic lock / unique index |
+| Booking without stylist work hours | 500 NPE | High (core dead) | YES | null-safe check + set hours in request |
+| DB down | Boot fails / 500s | Med | YES | actuator healthcheck + restart policy |
+| Missing env var | App fails to start with clear bind error | Med | YES | document required vars, commit .env.example |
+| Duplicate email signup race | duplicate users | Med | YES | unique index on users.email |
+| Delete treatment/stylist w/ bookings | FK violation 500 | Med | defer | catch DataIntegrityViolation -> 409 |
+| Unexpected exception | 500 default (stack in logs) | Med | YES | catch-all handler |
+
+--------------------------------------------------------------------------------
+17. FINAL PRODUCTION GATE
+--------------------------------------------------------------------------------
+VERDICT:  RED NOT READY — major issues exist (but genuinely close)
+
+  The verdict is RED only because the app does NOT START and the CORE booking
+  feature 500s — both fail even a "hello world in Docker" test.
+  Good news: every blocker is small, and your underlying architecture
+  (tenant scoping, conflict logic, DTO usage, secrets hygiene) is genuinely solid.
+
+MUST FIX BEFORE DOCKER (all small):
+  1. Ambiguous mapping — delete one of the two @GetMapping in BookingController
+     (getAllBookings ~line 31 vs getMyTenantBookings ~line 67). Nothing runs until gone.
+  2. @EnableMethodSecurity on SecurityConfig — otherwise role checks are fiction.
+  3. Work-hours NPE — null-safe working-hours check in createBooking + make work
+     hours settable (StylistRequest) — otherwise booking is dead.
+  4. Exception-handler import bug — GlobalExceptionHandler.java:8 must target your
+     own AccessDeniedException -> 403. Add a catch-all 500 handler too.
+  5. Get tests green — fix failing test (mocks need work hours) + make contextLoads
+     pass (fix #1). This is the "did I break production logic" gate before Docker.
+
+MUST FIX BEFORE DEPLOYMENT (can wait for Docker learning):
+  6. Treatment endpoints require OWNER.
+  7. JWT error handling -> 401 (expired/malformed/deleted user).
+  8. Unique index on users.email + booking indexes.
+  9. Env vars for DB_URL + Redis host; commit .env.example; strong JWT_SECRET on server.
+  10. CORS config for your frontend domain.
+  11. Booking concurrency fix (or accept as known limitation — it is small, do it).
+
+SHOULD FIX SOON:
+  12. Login returns 401 (not 404) on unknown email.
+  13. Consistent JSON error shape + validation (400) handler.
+  14. Logging at service layer + catch-all logging.
+  15. Delete booking -> 204; PUT status add @Valid.
+
+CAN WAIT:
+  - N+1 join-fetch, pagination, Flyway/validate, open-in-view=false,
+    orphan cleanup, README, Swagger.
+
+OPTIONAL / ADVANCED — SKIP for now:
+  - Redis caching (unused), K8s, CI/CD pipelines, rate limiting,
+    microservices, multi-instance HA.
+
+--------------------------------------------------------------------------------
+18. MINIMUM PRACTICAL PATH (current codebase -> Docker -> deployed MVP)
+--------------------------------------------------------------------------------
+  1.  Fix the 5 Docker blockers (1-5) in order: ambiguous mapping ->
+      @EnableMethodSecurity -> work-hours fix -> exception handler -> tests.
+  2.  Verify: mvnw.cmd test — all green.
+  3.  Quick security pass: @EnableMethodSecurity done; lock treatments to OWNER
+      in SecurityConfig (items 6-7).
+  4.  DB: add unique/index DDL (or @Column(unique=true) + index annotations and let
+      Hibernate apply on next start).
+  5.  Config: externalize DB_URL/Redis host; commit .env.example.
+  6.  Commit fixes as a "pre-deployment hardening" commit.
+  7.  Dockerize: Dockerfile + docker-compose.yml (app, mysql w/ volume, redis) +
+      actuator + .dockerignore.
+  8.  Run locally in Docker: docker compose up --build; curl /actuator/health = UP.
+  9.  Test the Dockerized app end-to-end: signup -> login -> create treatment +
+      stylist (with work hours) -> booking -> confirm -> complete -> cross-tenant
+      foreign ID returns 404.
+  10. Deploy to a single VPS with Caddy (HTTPS) + env vars + volume backup.
+  11. Test production: health check, one happy path, check logs.
+  12. Continue SaaS development (dashboard, payments, reminders) — with the
+      concurrency fix and indexes already in.
+
+================================================================================
+END OF AUDIT
+================================================================================

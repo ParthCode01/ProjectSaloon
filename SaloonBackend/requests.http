@@ -1,0 +1,40 @@
+### Owner Signup
+POST https://saloon-management-o9kn.onrender.com/api/auth/signup
+Content-Type: application/json
+
+{
+  "name": "Test Owner",
+  "email": "testowner2@gmail.com",
+  "password": "Test@12345",
+  "tenantName": "Test Saloon",
+  "tenantAddress": "Chandigarh",
+  "contact": "9876543210"
+}
+
+
+### Get tenants
+GET https://saloon-management-o9kn.onrender.com/api/tenants
+Authorization: Bearer YOUR_JWT_HERE
+
+
+
+### Create Treatment
+POST https://saloon-management-o9kn.onrender.com/api/treatments/create
+Authorization: Bearer YOUR_JWT_HERE
+Content-Type: application/json
+
+{
+  "name": "Haircut",
+  "durationMinutes": 30,
+  "price": 300,
+  "description": "Standard haircut"
+}
+
+### Owner Login
+POST https://saloon-management-o9kn.onrender.com/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "testowner2@gmail.com",
+  "password": "Test@12345"
+}
